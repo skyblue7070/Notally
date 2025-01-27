@@ -1,6 +1,8 @@
 package com.omgodse.notally.viewmodels
 
+import android.app.AlarmManager
 import android.app.Application
+import android.content.Context
 import android.graphics.BitmapFactory
 import android.graphics.Typeface
 import android.media.MediaMetadataRetriever
@@ -21,10 +23,11 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
 import com.omgodse.notally.AttachmentDeleteService
 import com.omgodse.notally.Cache
+import com.omgodse.notally.Progress
 import com.omgodse.notally.R
+import com.omgodse.notally.ReminderReceiver
 import com.omgodse.notally.image.Event
 import com.omgodse.notally.image.ImageError
-import com.omgodse.notally.image.ImageProgress
 import com.omgodse.notally.miscellaneous.IO
 import com.omgodse.notally.miscellaneous.Operations
 import com.omgodse.notally.miscellaneous.applySpans
@@ -37,6 +40,7 @@ import com.omgodse.notally.room.Folder
 import com.omgodse.notally.room.Image
 import com.omgodse.notally.room.ListItem
 import com.omgodse.notally.room.NotallyDatabase
+import com.omgodse.notally.room.Reminder
 import com.omgodse.notally.room.SpanRepresentation
 import com.omgodse.notally.room.Type
 import com.omgodse.notally.widget.WidgetProvider
@@ -75,11 +79,14 @@ class NotallyModel(private val app: Application) : AndroidViewModel(app) {
     val images = BetterLiveData<List<Image>>(emptyList())
     val audios = BetterLiveData<List<Audio>>(emptyList())
 
-    val addingImages = MutableLiveData<ImageProgress>()
+    val addingImages = MutableLiveData<Progress>()
     val eventBus = MutableLiveData<Event<List<ImageError>>>()
 
     var imageRoot = IO.getExternalImagesDirectory(app)
     var audioRoot = IO.getExternalAudioDirectory(app)
+
+    val reminder = MutableLiveData<Reminder>(null)
+    private val manager = app.getSystemService(Context.ALARM_SERVICE) as AlarmManager
 
     fun addAudio() {
         viewModelScope.launch {
@@ -135,7 +142,7 @@ class NotallyModel(private val app: Application) : AndroidViewModel(app) {
         val errorWhileRenaming = app.getString(R.string.error_while_renaming_image)
 
         viewModelScope.launch {
-            addingImages.value = ImageProgress(true, 0, uris.size)
+            addingImages.value = Progress(true, 0, uris.size, false)
 
             val successes = ArrayList<Image>()
             val errors = ArrayList<ImageError>()
@@ -185,10 +192,10 @@ class NotallyModel(private val app: Application) : AndroidViewModel(app) {
                     }
                 }
 
-                addingImages.value = ImageProgress(true, index + 1, uris.size)
+                addingImages.value = Progress(true, index + 1, uris.size, false)
             }
 
-            addingImages.value = ImageProgress(false, 0, 0)
+            addingImages.value = Progress(false, 0, 0, false)
 
             if (successes.isNotEmpty()) {
                 val copy = ArrayList(images.value)
@@ -219,6 +226,26 @@ class NotallyModel(private val app: Application) : AndroidViewModel(app) {
             "image/jpeg" -> "jpg"
             "image/webp" -> "webp"
             else -> null
+        }
+    }
+
+
+    fun deleteReminder() {
+        viewModelScope.launch {
+            val copy = reminder.value
+            if (copy != null) {
+                ReminderReceiver.deleteReminders(app, manager, listOf(id))
+                reminder.value = null
+                updateReminder()
+            }
+        }
+    }
+
+    fun setReminder(reminder: Reminder) {
+        viewModelScope.launch {
+            ReminderReceiver.setReminder(app, manager, id, reminder.timestamp)
+            this@NotallyModel.reminder.value = reminder
+            updateReminder()
         }
     }
 
@@ -254,6 +281,7 @@ class NotallyModel(private val app: Application) : AndroidViewModel(app) {
 
                 images.value = baseNote.images
                 audios.value = baseNote.audios
+                reminder.value = baseNote.reminder
             } else {
                 createBaseNote()
                 Toast.makeText(app, R.string.cant_find_note, Toast.LENGTH_LONG).show()
@@ -268,10 +296,14 @@ class NotallyModel(private val app: Application) : AndroidViewModel(app) {
 
     suspend fun deleteBaseNote() {
         withContext(Dispatchers.IO) { baseNoteDao.delete(id) }
-        WidgetProvider.sendBroadcast(app, longArrayOf(id))
+        WidgetProvider.sendBroadcast(app, id)
         val attachments = ArrayList(images.value + audios.value)
         if (attachments.isNotEmpty()) {
             AttachmentDeleteService.start(app, attachments)
+        }
+        val copy = reminder.value
+        if (copy != null) {
+            ReminderReceiver.deleteReminders(app, manager, listOf(id))
         }
     }
 
@@ -287,12 +319,16 @@ class NotallyModel(private val app: Application) : AndroidViewModel(app) {
         withContext(Dispatchers.IO) { baseNoteDao.updateAudios(id, audios.value) }
     }
 
+    private suspend fun updateReminder() {
+        withContext(Dispatchers.IO) { baseNoteDao.updateReminder(id, reminder.value) }
+    }
+
 
     private fun getBaseNote(): BaseNote {
         val spans = getFilteredSpans(body)
         val body = this.body.trimEnd().toString()
         val items = this.items.filter { item -> item.body.isNotEmpty() }
-        return BaseNote(id, type, folder, color, title, pinned, timestamp, labels, body, spans, items, images.value, audios.value)
+        return BaseNote(id, type, folder, color, title, pinned, timestamp, labels, body, spans, items, images.value, audios.value, reminder.value)
     }
 
     private fun getFilteredSpans(spanned: Spanned): ArrayList<SpanRepresentation> {
